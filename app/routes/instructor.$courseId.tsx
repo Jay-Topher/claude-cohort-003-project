@@ -59,6 +59,7 @@ import {
   Eye,
   FileEdit,
   GripVertical,
+  MessageSquare,
   Pencil,
   Plus,
   Save,
@@ -73,6 +74,11 @@ import {
 import { data, isRouteErrorResponse } from "react-router";
 import { z } from "zod";
 import { parseFormData, parseParams } from "~/lib/validation";
+import {
+  getPendingCommentsForCourse,
+  moderateComment,
+  type CommentWithUser,
+} from "~/services/commentService";
 
 const courseEditorParamsSchema = z.object({
   courseId: z.coerce.number().int(),
@@ -94,6 +100,8 @@ const courseEditorActionSchema = z.discriminatedUnion("intent", [
   z.object({ intent: z.literal("move-lesson"), lessonId: z.coerce.number().int(), targetModuleId: z.coerce.number().int(), targetPosition: z.coerce.number().int() }),
   z.object({ intent: z.literal("delete-lesson"), lessonId: z.coerce.number().int() }),
   z.object({ intent: z.literal("update-sales-copy"), salesCopy: z.string().optional() }),
+  z.object({ intent: z.literal("approve-comment"), commentId: z.coerce.number().int() }),
+  z.object({ intent: z.literal("reject-comment"), commentId: z.coerce.number().int() }),
 ]);
 
 export function meta({ data: loaderData }: Route.MetaArgs) {
@@ -184,8 +192,9 @@ export async function loader({ params, request }: Route.LoaderArgs) {
   });
 
   const quizCount = lessonQuizzes.length;
+  const pendingComments = getPendingCommentsForCourse(courseId);
 
-  return { course, lessonCount, enrollmentCount, students, quizCount };
+  return { course, lessonCount, enrollmentCount, students, quizCount, pendingComments };
 }
 
 export async function action({ params, request }: Route.ActionArgs) {
@@ -355,6 +364,26 @@ export async function action({ params, request }: Route.ActionArgs) {
   if (intent === "update-sales-copy") {
     updateCourseSalesCopy(courseId, parsed.data.salesCopy || null);
     return { success: true, field: "sales-copy" };
+  }
+
+  if (intent === "approve-comment") {
+    try {
+      moderateComment(parsed.data.commentId, currentUserId, "approve");
+    } catch (err: unknown) {
+      const message = err instanceof Error ? err.message : "Could not approve comment.";
+      return data({ error: message }, { status: 400 });
+    }
+    return { success: true, field: "comment" };
+  }
+
+  if (intent === "reject-comment") {
+    try {
+      moderateComment(parsed.data.commentId, currentUserId, "reject");
+    } catch (err: unknown) {
+      const message = err instanceof Error ? err.message : "Could not reject comment.";
+      return data({ error: message }, { status: 400 });
+    }
+    return { success: true, field: "comment" };
   }
 
   throw data("Invalid action.", { status: 400 });
@@ -984,7 +1013,7 @@ function statusBadgeColor(status: string) {
 export default function InstructorCourseEditor({
   loaderData,
 }: Route.ComponentProps) {
-  const { course, lessonCount, enrollmentCount, students, quizCount } = loaderData;
+  const { course, lessonCount, enrollmentCount, students, quizCount, pendingComments } = loaderData;
   const statusFetcher = useFetcher();
   const reorderFetcher = useFetcher();
   const lessonReorderFetcher = useFetcher();
@@ -1192,6 +1221,15 @@ export default function InstructorCourseEditor({
           <TabsTrigger value="students">
             <Users className="size-4" />
             Students
+          </TabsTrigger>
+          <TabsTrigger value="comments" className="relative">
+            <MessageSquare className="size-4" />
+            Comments
+            {pendingComments.length > 0 && (
+              <span className="ml-1.5 rounded-full bg-amber-500 px-1.5 py-0.5 text-xs text-white">
+                {pendingComments.length}
+              </span>
+            )}
           </TabsTrigger>
         </TabsList>
 
@@ -1652,8 +1690,91 @@ export default function InstructorCourseEditor({
             </Card>
           )}
         </TabsContent>
+
+        {/* Comments Tab */}
+        <TabsContent value="comments" className="mt-6">
+          {pendingComments.length === 0 ? (
+            <Card>
+              <CardContent className="py-8 text-center text-muted-foreground">
+                <MessageSquare className="mx-auto mb-3 size-8 opacity-30" />
+                <p>No comments awaiting moderation.</p>
+              </CardContent>
+            </Card>
+          ) : (
+            <div className="space-y-4">
+              {pendingComments.map((comment) => (
+                <CommentModerationCard key={comment.id} comment={comment} />
+              ))}
+            </div>
+          )}
+        </TabsContent>
       </Tabs>
     </div>
+  );
+}
+
+function CommentModerationCard({ comment }: { comment: CommentWithUser }) {
+  const fetcher = useFetcher<{ success?: boolean; error?: string }>();
+
+  useEffect(() => {
+    if (fetcher.state === "idle" && fetcher.data?.error) {
+      toast.error(fetcher.data.error);
+    }
+  }, [fetcher.state, fetcher.data]);
+
+  const isSubmitting = fetcher.state !== "idle";
+
+  return (
+    <Card>
+      <CardContent className="pt-4">
+        <div className="mb-3 flex items-start justify-between gap-4">
+          <div className="flex items-center gap-2">
+            <div className="flex size-8 shrink-0 items-center justify-center rounded-full bg-muted text-xs font-semibold uppercase">
+              {comment.userName.charAt(0)}
+            </div>
+            <div>
+              <p className="text-sm font-medium">{comment.userName}</p>
+              <p className="text-xs text-muted-foreground">
+                {new Date(comment.createdAt).toLocaleDateString("en-US", {
+                  year: "numeric",
+                  month: "short",
+                  day: "numeric",
+                })}
+              </p>
+            </div>
+          </div>
+          <div className="flex shrink-0 gap-2">
+            <fetcher.Form method="post">
+              <input type="hidden" name="intent" value="approve-comment" />
+              <input type="hidden" name="commentId" value={comment.id} />
+              <Button
+                type="submit"
+                size="sm"
+                variant="outline"
+                className="border-green-500 text-green-600 hover:bg-green-50 hover:text-green-700 dark:hover:bg-green-950"
+                disabled={isSubmitting}
+              >
+                Approve
+              </Button>
+            </fetcher.Form>
+            <fetcher.Form method="post">
+              <input type="hidden" name="intent" value="reject-comment" />
+              <input type="hidden" name="commentId" value={comment.id} />
+              <Button
+                type="submit"
+                size="sm"
+                variant="outline"
+                className="border-destructive text-destructive hover:bg-destructive/10"
+                disabled={isSubmitting}
+              >
+                Reject
+              </Button>
+            </fetcher.Form>
+          </div>
+        </div>
+        <p className="text-sm">{comment.body}</p>
+      </CardContent>
+    </Card>
   );
 }
 
