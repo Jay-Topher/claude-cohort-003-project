@@ -1,5 +1,5 @@
-import { useEffect } from "react";
-import { Form, Link, useSearchParams } from "react-router";
+import { useEffect, useState } from "react";
+import { Form, Link, useSearchParams, useFetcher } from "react-router";
 import { toast } from "sonner";
 import type { Route } from "./+types/courses.$slug";
 import {
@@ -31,6 +31,7 @@ import {
   CheckCircle2,
   Circle,
   Clock,
+  MessageSquare,
   Pencil,
   PlayCircle,
   Star,
@@ -48,6 +49,13 @@ import {
   getUserRatingForCourse,
   upsertCourseRating,
 } from "~/services/ratingService";
+import {
+  getApprovedCommentsForCourse,
+  getUserPendingCommentsForCourse,
+  submitComment,
+  deleteComment,
+  type CommentWithUser,
+} from "~/services/commentService";
 
 export function meta({ data: loaderData }: Route.MetaArgs) {
   const title = loaderData?.course?.title ?? "Course";
@@ -114,6 +122,12 @@ export async function loader({ params, request }: Route.LoaderArgs) {
       ? (getUserRatingForCourse(currentUserId, course.id)?.rating ?? null)
       : null;
 
+  const approvedComments = getApprovedCommentsForCourse(course.id);
+  const userPendingComments =
+    currentUserId && enrolled
+      ? getUserPendingCommentsForCourse(currentUserId, course.id)
+      : [];
+
   return {
     course: courseWithDetails,
     salesCopyHtml,
@@ -128,6 +142,8 @@ export async function loader({ params, request }: Route.LoaderArgs) {
     averageRating: ratingData.average,
     ratingCount: ratingData.count,
     userRating,
+    approvedComments,
+    userPendingComments,
   };
 }
 
@@ -140,16 +156,43 @@ export async function action({ params, request }: Route.ActionArgs) {
   if (!currentUserId) throw data("Sign in required", { status: 401 });
 
   if (!isUserEnrolled(currentUserId, course.id)) {
-    throw data("Must be enrolled to rate this course", { status: 403 });
+    throw data("Must be enrolled to interact with this course", { status: 403 });
   }
 
   const formData = await request.formData();
-  const rating = Number(formData.get("rating"));
+  const intent = formData.get("intent");
 
+  if (intent === "submit-comment") {
+    const body = String(formData.get("body") ?? "").trim();
+    if (body.length < 10) {
+      return data({ error: "Comment must be at least 10 characters." }, { status: 400 });
+    }
+    if (body.length > 1000) {
+      return data({ error: "Comment cannot exceed 1000 characters." }, { status: 400 });
+    }
+    submitComment(currentUserId, course.id, body);
+    return { success: true };
+  }
+
+  if (intent === "delete-comment") {
+    const commentId = Number(formData.get("commentId"));
+    if (!Number.isInteger(commentId)) {
+      throw data("Invalid comment ID", { status: 400 });
+    }
+    try {
+      deleteComment(commentId, currentUserId);
+    } catch (err: unknown) {
+      const message = err instanceof Error ? err.message : "Could not delete comment.";
+      return data({ error: message }, { status: 400 });
+    }
+    return { success: true };
+  }
+
+  // Default: rate intent (kept for backward compatibility with existing star form)
+  const rating = Number(formData.get("rating"));
   if (!Number.isInteger(rating) || rating < 1 || rating > 5) {
     throw data("Invalid rating", { status: 400 });
   }
-
   upsertCourseRating(currentUserId, course.id, rating);
   return null;
 }
@@ -220,6 +263,8 @@ export default function CourseDetail({ loaderData }: Route.ComponentProps) {
     averageRating,
     ratingCount,
     userRating,
+    approvedComments,
+    userPendingComments,
   } = loaderData;
   const isInstructor = currentUserId === course.instructorId;
   const [searchParams, setSearchParams] = useSearchParams();
@@ -538,6 +583,15 @@ export default function CourseDetail({ loaderData }: Route.ComponentProps) {
           </Card>
         </div>
       </div>
+
+      {/* Comments section */}
+      <div className="mt-12">
+        <CourseComments
+          approvedComments={approvedComments}
+          userPendingComments={userPendingComments}
+          enrolled={enrolled}
+        />
+      </div>
     </div>
   );
 }
@@ -671,6 +725,134 @@ function CourseContent({
                     );
                   })}
                 </ul>
+              </CardContent>
+            </Card>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function CourseComments({
+  approvedComments,
+  userPendingComments,
+  enrolled,
+}: {
+  approvedComments: CommentWithUser[];
+  userPendingComments: { id: number; body: string }[];
+  enrolled: boolean;
+}) {
+  const submitFetcher = useFetcher<{ success?: boolean; error?: string }>();
+  const deleteFetcher = useFetcher<{ success?: boolean; error?: string }>();
+  const [formKey, setFormKey] = useState(0);
+
+  useEffect(() => {
+    if (submitFetcher.state === "idle" && submitFetcher.data?.error) {
+      toast.error(submitFetcher.data.error);
+    }
+    if (submitFetcher.state === "idle" && submitFetcher.data?.success) {
+      setFormKey((k) => k + 1);
+    }
+  }, [submitFetcher.state, submitFetcher.data]);
+
+  useEffect(() => {
+    if (deleteFetcher.state === "idle" && deleteFetcher.data?.error) {
+      toast.error(deleteFetcher.data.error);
+    }
+  }, [deleteFetcher.state, deleteFetcher.data]);
+
+  return (
+    <div>
+      <h2 className="mb-6 flex items-center gap-2 text-2xl font-bold">
+        <MessageSquare className="size-6" />
+        Comments
+        {approvedComments.length > 0 && (
+          <span className="text-base font-normal text-muted-foreground">
+            ({approvedComments.length})
+          </span>
+        )}
+      </h2>
+
+      {/* Student's pending comments (only visible to them) */}
+      {userPendingComments.length > 0 && (
+        <div className="mb-6 space-y-3">
+          {userPendingComments.map((comment) => (
+            <Card key={comment.id} className="border-amber-200 bg-amber-50 dark:border-amber-800 dark:bg-amber-950/30">
+              <CardContent className="pt-4">
+                <div className="mb-2 flex items-center justify-between">
+                  <span className="rounded-full bg-amber-100 px-2.5 py-0.5 text-xs font-medium text-amber-700 dark:bg-amber-900 dark:text-amber-300">
+                    Pending review
+                  </span>
+                  <deleteFetcher.Form method="post">
+                    <input type="hidden" name="intent" value="delete-comment" />
+                    <input type="hidden" name="commentId" value={comment.id} />
+                    <Button
+                      type="submit"
+                      variant="ghost"
+                      size="sm"
+                      className="text-xs text-muted-foreground hover:text-destructive"
+                      disabled={deleteFetcher.state !== "idle"}
+                    >
+                      Delete
+                    </Button>
+                  </deleteFetcher.Form>
+                </div>
+                <p className="text-sm text-muted-foreground">{comment.body}</p>
+              </CardContent>
+            </Card>
+          ))}
+        </div>
+      )}
+
+      {/* Comment submission form — always visible to enrolled students */}
+      {enrolled && (
+        <Card className="mb-8">
+          <CardHeader>
+            <h3 className="text-sm font-semibold">Leave a Comment</h3>
+          </CardHeader>
+          <CardContent>
+            <submitFetcher.Form key={formKey} method="post" className="space-y-3">
+              <input type="hidden" name="intent" value="submit-comment" />
+              <textarea
+                name="body"
+                rows={4}
+                className="w-full rounded-md border bg-background px-3 py-2 text-sm placeholder:text-muted-foreground focus:outline-none focus:ring-2 focus:ring-ring"
+                placeholder="Share your thoughts about this course (10–1000 characters)..."
+                maxLength={1000}
+                disabled={submitFetcher.state !== "idle"}
+              />
+              <Button type="submit" disabled={submitFetcher.state !== "idle"} size="sm">
+                Submit Comment
+              </Button>
+            </submitFetcher.Form>
+          </CardContent>
+        </Card>
+      )}
+
+      {/* Approved comments list */}
+      {approvedComments.length === 0 ? (
+        <p className="text-sm text-muted-foreground">
+          No comments yet.{" "}
+          {enrolled ? "Be the first to share your thoughts!" : ""}
+        </p>
+      ) : (
+        <div className="space-y-4">
+          {approvedComments.map((comment) => (
+            <Card key={comment.id}>
+              <CardContent className="pt-4">
+                <div className="mb-2 flex items-center gap-2">
+                  <UserAvatar
+                    name={comment.userName}
+                    avatarUrl={comment.userAvatarUrl}
+                    className="size-7"
+                  />
+                  <span className="text-sm font-medium">{comment.userName}</span>
+                  <span className="text-xs text-muted-foreground">
+                    {new Date(comment.moderatedAt ?? comment.createdAt).toLocaleDateString()}
+                  </span>
+                </div>
+                <p className="text-sm">{comment.body}</p>
               </CardContent>
             </Card>
           ))}
